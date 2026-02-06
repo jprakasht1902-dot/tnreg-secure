@@ -3,15 +3,14 @@ import crypto from "crypto";
 // ================= CONFIG =================
 const BIN_ID = process.env.JSONBIN_BIN_ID;
 const JSONBIN_KEY = process.env.JSONBIN_KEY;
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // MUST be exactly 32 bytes
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; 
 const IV_LENGTH = 16;
 const ALGORITHM = "aes-256-cbc";
 
-// Add "Bearer " prefix to match client headers
 const API_SECRET_READ = `Bearer ${process.env.API_SECRET_READ}`;
 const API_SECRET_WRITE = `Bearer ${process.env.API_SECRET_WRITE}`;
 
-// Fields to Encrypt/Decrypt
+// Fields to Encrypt in Database
 const SENSITIVE_FIELDS = [
   "aad1", "aad2", "aad3",
   "ph1", "ph2",
@@ -22,15 +21,12 @@ const SENSITIVE_FIELDS = [
 // ================= SECURITY HELPERS =================
 const maskPhone = p => p ? "******" + p.slice(-4) : "";
 const maskAadhaar = a => a ? "XXXX XXXX " + a.slice(-4) : "";
-const maskName = n => n ? n[0] + "*".repeat(n.length - 1) : "";
+const maskName = n => n ? n[0] + "*".repeat(Math.min(n.length - 1, 10)) : ""; // Limit stars
 
 // ================= ENCRYPTION ENGINE =================
 function getKey() {
-  // Ensure key is buffer
   const keyBuffer = Buffer.from(ENCRYPTION_KEY);
-  if (keyBuffer.length !== 32) {
-    throw new Error("ENCRYPTION_KEY must be exactly 32 bytes");
-  }
+  if (keyBuffer.length !== 32) throw new Error("ENCRYPTION_KEY must be 32 bytes");
   return keyBuffer;
 }
 
@@ -42,10 +38,7 @@ function encrypt(text) {
     let encrypted = cipher.update(text, "utf8", "hex");
     encrypted += cipher.final("hex");
     return iv.toString("hex") + ":" + encrypted;
-  } catch (e) {
-    console.error("Encrypt Error:", e);
-    return text;
-  }
+  } catch (e) { console.error("Encrypt Error:", e); return text; }
 }
 
 function decrypt(text) {
@@ -57,17 +50,13 @@ function decrypt(text) {
     let decrypted = decipher.update(encrypted, "hex", "utf8");
     decrypted += decipher.final("utf8");
     return decrypted;
-  } catch (e) {
-    console.error("Decrypt Error:", e);
-    return text; // Return original if fail
-  }
+  } catch (e) { console.error("Decrypt Error:", e); return text; }
 }
 
 // ================= OBJECT RECURSION =================
 function encryptObject(obj) {
   if (!obj || typeof obj !== "object") return obj;
   const result = Array.isArray(obj) ? [] : {};
-
   for (const key in obj) {
     const value = obj[key];
     if (SENSITIVE_FIELDS.includes(key) && typeof value === "string") {
@@ -84,7 +73,6 @@ function encryptObject(obj) {
 function decryptObject(obj) {
   if (!obj || typeof obj !== "object") return obj;
   const result = Array.isArray(obj) ? [] : {};
-
   for (const key in obj) {
     const value = obj[key];
     if (SENSITIVE_FIELDS.includes(key) && typeof value === "string") {
@@ -98,13 +86,15 @@ function decryptObject(obj) {
   return result;
 }
 
-// Mask data for frontend display
+// ================= MASKING LOGIC =================
+// This runs ONLY if ?unmask=true is NOT present
 function maskRecord(record) {
   if (!Array.isArray(record)) return record;
   return record.map(r => ({
-    ...r,
+    ...r, // 1. Keep ALL sections, drafts, and HTML visible
     partyData: r.partyData ? {
-      ...r.partyData,
+      ...r.partyData, // 2. Keep numeric values (prices, fees) visible
+      // 3. Only Mask Sensitive PII in Buyers/Sellers
       buyers: (r.partyData.buyers || []).map(b => ({
         ...b,
         name: maskName(b.name),
@@ -123,95 +113,72 @@ function maskRecord(record) {
 
 // ================= MAIN HANDLER =================
 export default async function handler(req, res) {
-  // CORS Configuration
-  const allowedOrigins = [
-    "https://tnreg.wapka.site",
-    "http://localhost:3000",
-    "http://127.0.0.1:5500" // Added for local testing
-  ];
-  
+  // CORS
+  const allowedOrigins = ["https://tnreg.wapka.site", "http://localhost:3000", "http://127.0.0.1:5500"];
   const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  } else {
-    // Optional: Allow all during development, restrict in production
-    res.setHeader("Access-Control-Allow-Origin", "*"); 
+  if (allowedOrigins.includes(origin) || !origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
   }
-  
   res.setHeader("Access-Control-Allow-Methods", "GET,PUT,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
 
-  // Handle Preflight
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  // Validate Env Vars
   if (!BIN_ID || !JSONBIN_KEY || !ENCRYPTION_KEY) {
-    return res.status(500).json({ error: "Server Misconfigured (Missing ENVs)" });
+    return res.status(500).json({ error: "Server Misconfigured" });
   }
 
   const authHeader = req.headers.authorization;
 
   try {
-    // ================= GET REQUEST =================
+    // ---------------- GET ----------------
     if (req.method === "GET") {
-      // 1. Auth Check
       if (authHeader !== API_SECRET_READ && authHeader !== API_SECRET_WRITE) {
-        return res.status(401).json({ error: "Unauthorized Access" });
+        return res.status(401).json({ error: "Unauthorized" });
       }
 
-      // 2. Fetch from Database (JSONBin)
+      // 1. Fetch
       const response = await fetch(`https://api.jsonbin.io/v3/b/${BIN_ID}/latest`, {
         headers: { "X-Master-Key": JSONBIN_KEY }
       });
-
-      if (!response.ok) throw new Error("Database Fetch Failed");
-
+      if (!response.ok) throw new Error("DB Error");
+      
       const bin = await response.json();
-      const rawData = bin.record || []; // Handle case where record is wrapper
+      const rawData = bin.record || []; 
 
-      // 3. Decrypt Data (Server Side)
+      // 2. Decrypt
       const decryptedData = decryptObject(rawData);
 
-      // 4. Mask Data (For Security)
-      // Note: If users need to EDIT data, you might need a query param (e.g., ?edit=true)
-      // to skip masking, provided they have WRITE permission.
-      const safeData = maskRecord(decryptedData);
+      // 3. Logic: Check for ?unmask=true
+      // If Editor calls with ?unmask=true -> Send Full Data
+      // If Dashboard calls without it -> Send Masked Data
+      const isUnmaskRequested = req.query.unmask === "true";
+      
+      const finalData = isUnmaskRequested ? decryptedData : maskRecord(decryptedData);
 
-      return res.status(200).json({ record: safeData });
+      return res.status(200).json({ record: finalData });
     }
 
-    // ================= PUT REQUEST =================
+    // ---------------- PUT ----------------
     if (req.method === "PUT") {
-      // 1. Strict Auth Check (Write Access Only)
-      if (authHeader !== API_SECRET_WRITE) {
-        return res.status(401).json({ error: "Write Access Denied" });
-      }
+      if (authHeader !== API_SECRET_WRITE) return res.status(401).json({ error: "Denied" });
 
-      // 2. Encrypt Incoming Data
-      // IMPORTANT: Ensure frontend sends unmasked data, or existing data will be lost!
       const encryptedData = encryptObject(req.body);
 
-      // 3. Save to Database
       const response = await fetch(`https://api.jsonbin.io/v3/b/${BIN_ID}`, {
         method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Master-Key": JSONBIN_KEY
-        },
+        headers: { "Content-Type": "application/json", "X-Master-Key": JSONBIN_KEY },
         body: JSON.stringify(encryptedData)
       });
 
-      if (!response.ok) throw new Error("Database Update Failed");
-
-      const result = await response.json();
-      return res.status(200).json({ success: true, metadata: result.metadata });
+      if (!response.ok) throw new Error("Update Failed");
+      return res.status(200).json({ success: true });
     }
 
-    // Method Not Allowed
     return res.status(405).json({ error: "Method not allowed" });
 
   } catch (err) {
-    console.error("API Error:", err);
-    return res.status(500).json({ error: "Internal Server Error", details: err.message });
+    console.error(err);
+    return res.status(500).json({ error: "Server Error", details: err.message });
   }
 }
