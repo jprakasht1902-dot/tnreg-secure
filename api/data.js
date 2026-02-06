@@ -10,7 +10,6 @@ const ALGORITHM = "aes-256-cbc";
 const API_SECRET_READ = `Bearer ${process.env.API_SECRET_READ}`;
 const API_SECRET_WRITE = `Bearer ${process.env.API_SECRET_WRITE}`;
 
-// Fields to Encrypt in Database
 const SENSITIVE_FIELDS = [
   "aad1", "aad2", "aad3",
   "ph1", "ph2",
@@ -18,10 +17,17 @@ const SENSITIVE_FIELDS = [
   "dist", "taluk", "village", "street", "door"
 ];
 
-// ================= SECURITY HELPERS =================
+// ================= SECURITY HELPERS (UPDATED) =================
+// 1. Phone: Mask first 6 digits, show last 4
 const maskPhone = p => p ? "******" + p.slice(-4) : "";
+
+// 2. Aadhaar: Mask first 8 digits, show last 4
 const maskAadhaar = a => a ? "XXXX XXXX " + a.slice(-4) : "";
-const maskName = n => n ? n[0] + "*".repeat(Math.min(n.length - 1, 10)) : ""; // Limit stars
+
+// 3. Name/Text: SHOW ALPHABETS, MASK NUMBERS (As requested)
+// "John Doe" -> "John Doe"
+// "Door 24" -> "Door **"
+const maskTextPreserveAlpha = n => n ? n.replace(/[0-9]/g, "*") : ""; 
 
 // ================= ENCRYPTION ENGINE =================
 function getKey() {
@@ -53,7 +59,6 @@ function decrypt(text) {
   } catch (e) { console.error("Decrypt Error:", e); return text; }
 }
 
-// ================= OBJECT RECURSION =================
 function encryptObject(obj) {
   if (!obj || typeof obj !== "object") return obj;
   const result = Array.isArray(obj) ? [] : {};
@@ -86,24 +91,23 @@ function decryptObject(obj) {
   return result;
 }
 
-// ================= MASKING LOGIC =================
-// This runs ONLY if ?unmask=true is NOT present
+// ================= MASKING LOGIC (UPDATED) =================
 function maskRecord(record) {
   if (!Array.isArray(record)) return record;
   return record.map(r => ({
-    ...r, // 1. Keep ALL sections, drafts, and HTML visible
+    ...r, 
     partyData: r.partyData ? {
-      ...r.partyData, // 2. Keep numeric values (prices, fees) visible
-      // 3. Only Mask Sensitive PII in Buyers/Sellers
+      ...r.partyData, 
+      // Apply "Alpha Visible / Numeric Hidden" rule to Name
       buyers: (r.partyData.buyers || []).map(b => ({
         ...b,
-        name: maskName(b.name),
+        name: maskTextPreserveAlpha(b.name), 
         ph1: maskPhone(b.ph1),
         aad3: maskAadhaar(b.aad3)
       })),
       sellers: (r.partyData.sellers || []).map(s => ({
         ...s,
-        name: maskName(s.name),
+        name: maskTextPreserveAlpha(s.name),
         ph1: maskPhone(s.ph1),
         aad3: maskAadhaar(s.aad3)
       }))
@@ -113,7 +117,6 @@ function maskRecord(record) {
 
 // ================= MAIN HANDLER =================
 export default async function handler(req, res) {
-  // CORS
   const allowedOrigins = ["https://tnreg.wapka.site", "http://localhost:3000", "http://127.0.0.1:5500"];
   const origin = req.headers.origin;
   if (allowedOrigins.includes(origin) || !origin) {
@@ -131,13 +134,11 @@ export default async function handler(req, res) {
   const authHeader = req.headers.authorization;
 
   try {
-    // ---------------- GET ----------------
     if (req.method === "GET") {
       if (authHeader !== API_SECRET_READ && authHeader !== API_SECRET_WRITE) {
         return res.status(401).json({ error: "Unauthorized" });
       }
 
-      // 1. Fetch
       const response = await fetch(`https://api.jsonbin.io/v3/b/${BIN_ID}/latest`, {
         headers: { "X-Master-Key": JSONBIN_KEY }
       });
@@ -146,31 +147,24 @@ export default async function handler(req, res) {
       const bin = await response.json();
       const rawData = bin.record || []; 
 
-      // 2. Decrypt
       const decryptedData = decryptObject(rawData);
 
-      // 3. Logic: Check for ?unmask=true
-      // If Editor calls with ?unmask=true -> Send Full Data
-      // If Dashboard calls without it -> Send Masked Data
+      // If ?unmask=true is sent, show everything (Edit Mode)
+      // If NOT sent, use the new mask logic (Dashboard Mode)
       const isUnmaskRequested = req.query.unmask === "true";
-      
       const finalData = isUnmaskRequested ? decryptedData : maskRecord(decryptedData);
 
       return res.status(200).json({ record: finalData });
     }
 
-    // ---------------- PUT ----------------
     if (req.method === "PUT") {
       if (authHeader !== API_SECRET_WRITE) return res.status(401).json({ error: "Denied" });
-
       const encryptedData = encryptObject(req.body);
-
       const response = await fetch(`https://api.jsonbin.io/v3/b/${BIN_ID}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json", "X-Master-Key": JSONBIN_KEY },
         body: JSON.stringify(encryptedData)
       });
-
       if (!response.ok) throw new Error("Update Failed");
       return res.status(200).json({ success: true });
     }
