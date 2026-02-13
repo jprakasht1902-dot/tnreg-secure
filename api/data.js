@@ -117,7 +117,7 @@ function maskRecord(record) {
 
 // ================= MAIN HANDLER =================
 export default async function handler(req, res) {
-  const allowedOrigins = ["https://tnreg.wapka.site", "http://localhost:3000", "http://127.0.0.1:5500"];
+  const allowedOrigins = ["https://tnreg.wapka.site", "https://tndoc.online", "http://localhost:3000", "http://127.0.0.1:5500"];
   const origin = req.headers.origin;
   if (allowedOrigins.includes(origin) || !origin) {
     res.setHeader("Access-Control-Allow-Origin", origin || "*");
